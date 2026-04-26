@@ -16,44 +16,38 @@ def load_episodes() -> list[dict]:
 
 def save_episode(episode: dict) -> None:
     episodes = load_episodes()
-    # Avoid duplicates by ia_url
-    if not any(e.get("ia_url") == episode["ia_url"] for e in episodes):
+    if not any(e.get("filename") == episode["filename"] for e in episodes):
         episodes.append(episode)
         with open(EPISODES_FILE, "w", encoding="utf-8") as f:
             json.dump(episodes, f, indent=2, ensure_ascii=False)
 
 
-def build_rss(host_url: str, podcast_name: str, podcast_description: str) -> bytes:
-    """Generate a valid Apple Podcasts-compatible RSS feed."""
+def build_rss(host_url: str) -> bytes:
     feed_url = f"{host_url}/feed.xml"
 
     fg = FeedGenerator()
     fg.load_extension("podcast")
-
     fg.id(feed_url)
-    fg.title(podcast_name)
-    fg.description(podcast_description)
-    fg.author({"name": podcast_name})
+    fg.title("My YouTube Podcast")
+    fg.description("Audio downloaded from YouTube.")
+    fg.author({"name": "YouTube Podcast"})
     fg.link(href=feed_url, rel="self")
     fg.language("en")
-    fg.podcast.itunes_author(podcast_name)
-    fg.podcast.itunes_summary(podcast_description)
+    fg.podcast.itunes_author("YouTube Podcast")
     fg.podcast.itunes_explicit("no")
     fg.podcast.itunes_category("Technology")
 
     for ep in reversed(load_episodes()):
+        audio_url = f"{host_url}/audio/{ep['filename']}"
         fe = fg.add_entry()
-        fe.id(ep["ia_url"])
+        fe.id(audio_url)
         fe.title(ep["title"])
         fe.description(ep.get("description") or ep["title"])
-        fe.enclosure(ep["ia_url"], 0, "audio/mpeg")
+        fe.enclosure(audio_url, 0, "audio/mpeg")
         fe.podcast.itunes_duration(str(ep.get("duration", 0)))
         fe.podcast.itunes_author(ep.get("uploader", ""))
-
-        thumbnail = ep.get("thumbnail", "")
-        if thumbnail:
-            fe.podcast.itunes_image(thumbnail)
-
+        if ep.get("thumbnail"):
+            fe.podcast.itunes_image(ep["thumbnail"])
         pub = ep.get("published")
         if pub:
             dt = datetime.fromisoformat(pub)
