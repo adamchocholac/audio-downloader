@@ -1,63 +1,156 @@
 """
-YouTube Audio Downloader — web app entry point.
+YouTube Audio → Apple Podcasts bridge.
 
 Run:
     python app.py
 
 Then open http://localhost:5000 in your browser.
+On first run you will be prompted to enter your Internet Archive credentials
+and podcast name. After that every downloaded video is:
+  1. Downloaded from YouTube as MP3
+  2. Uploaded to Internet Archive (free, permanent hosting)
+  3. Added to an RSS feed at /feed.xml
+  4. Subscribe to that URL once in Apple Podcasts — new episodes appear automatically.
 """
 
+import json
 import threading
 import uuid
 import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory, abort
+from flask import Flask, Response, jsonify, request, send_from_directory, abort
 
 from downloader import download_audio, DOWNLOADS_DIR
+from uploader import upload_to_archive
+from feed import build_rss, save_episode, load_episodes
 
-app = Flask(__name__)
+app  = Flask(__name__)
 PORT = int(os.environ.get("PORT", 5000))
+HOST = os.environ.get("HOST_URL", f"http://localhost:{PORT}")
 
-# In-memory job store  { job_id: { status, result, error } }
+CONFIG_FILE = Path("config.json")
+
+# In-memory job store
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(cfg: dict) -> None:
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def config_complete() -> bool:
+    cfg = load_config()
+    return bool(cfg.get("ia_access_key") and cfg.get("ia_secret_key") and cfg.get("podcast_id"))
+
+
+def slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_-]+", "-", text)
+    return text[:60]
 
 
 # ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
 
-def _run_download(job_id: str, url: str) -> None:
+def _run_job(job_id: str, url: str) -> None:
+    cfg = load_config()
+
     def on_progress(info: dict) -> None:
         with jobs_lock:
             if job_id in jobs:
                 jobs[job_id].update(info)
 
     try:
+        # Phase 1 & 2: download + convert to MP3
         result = download_audio(url, on_progress=on_progress)
+        mp3_path = DOWNLOADS_DIR / result.filename
+
+        # Phase 3: upload to Internet Archive
+        video_id   = _extract_video_id(url)
+        identifier = f"{cfg['podcast_id']}-{video_id or uuid.uuid4().hex[:8]}"
+
+        ia_url = upload_to_archive(
+            identifier  = identifier,
+            file_path   = mp3_path,
+            title       = result.title,
+            access_key  = cfg["ia_access_key"],
+            secret_key  = cfg["ia_secret_key"],
+            on_progress = on_progress,
+        )
+
+        # Phase 4: save to episode store
+        save_episode({
+            "title":       result.title,
+            "filename":    result.filename,
+            "ia_url":      ia_url,
+            "duration":    result.duration,
+            "uploader":    result.uploader,
+            "thumbnail":   result.thumbnail,
+            "description": result.title,
+            "published":   datetime.now(timezone.utc).isoformat(),
+        })
+
         with jobs_lock:
             jobs[job_id] = {
-                "status": "done",
-                "title": result.title,
+                "status":   "done",
+                "title":    result.title,
                 "filename": result.filename,
+                "ia_url":   ia_url,
                 "duration": result.duration,
                 "uploader": result.uploader,
-                "thumbnail": result.thumbnail,
+                "thumbnail":result.thumbnail,
             }
+
     except Exception as exc:
         with jobs_lock:
             jobs[job_id] = {"status": "error", "error": str(exc)}
+
+
+def _extract_video_id(url: str) -> str | None:
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
 
 
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
 
+@app.post("/api/setup")
+def api_setup():
+    data = request.get_json(force=True, silent=True) or {}
+    required = ["ia_access_key", "ia_secret_key", "podcast_name", "podcast_id"]
+    for key in required:
+        if not data.get(key, "").strip():
+            return jsonify({"error": f"Missing field: {key}"}), 400
+    save_config({k: data[k].strip() for k in required})
+    return jsonify({"ok": True})
+
+
 @app.post("/api/download")
 def start_download():
-    data = request.get_json(force=True, silent=True) or {}
-    url = (data.get("url") or "").strip()
+    if not config_complete():
+        return jsonify({"error": "Setup not complete"}), 400
+
+    data   = request.get_json(force=True, silent=True) or {}
+    url    = (data.get("url") or "").strip()
     if not url:
         return jsonify({"error": "Missing 'url'"}), 400
 
@@ -65,9 +158,7 @@ def start_download():
     with jobs_lock:
         jobs[job_id] = {"status": "pending"}
 
-    thread = threading.Thread(target=_run_download, args=(job_id, url), daemon=True)
-    thread.start()
-
+    threading.Thread(target=_run_job, args=(job_id, url), daemon=True).start()
     return jsonify({"job_id": job_id}), 202
 
 
@@ -80,21 +171,45 @@ def job_status(job_id: str):
     return jsonify(job)
 
 
+@app.get("/api/episodes")
+def api_episodes():
+    return jsonify(load_episodes())
+
+
+@app.get("/api/config")
+def api_config():
+    cfg = load_config()
+    # Never expose keys to the frontend
+    return jsonify({
+        "configured":        config_complete(),
+        "podcast_name":      cfg.get("podcast_name", ""),
+        "podcast_id":        cfg.get("podcast_id", ""),
+        "ia_access_key_set": bool(cfg.get("ia_access_key")),
+    })
+
+
+@app.get("/feed.xml")
+def rss_feed():
+    cfg = load_config()
+    rss = build_rss(
+        host_url            = HOST,
+        podcast_name        = cfg.get("podcast_name", "My YouTube Podcast"),
+        podcast_description = cfg.get("podcast_description", "Audio from YouTube."),
+    )
+    return Response(rss, mimetype="application/rss+xml")
+
+
 @app.get("/api/file/<path:filename>")
 def serve_file(filename: str):
     filepath = DOWNLOADS_DIR / filename
     if not filepath.exists():
         abort(404)
-    return send_from_directory(
-        str(DOWNLOADS_DIR.resolve()),
-        filename,
-        as_attachment=True,
-        download_name=filename,
-    )
+    return send_from_directory(str(DOWNLOADS_DIR.resolve()), filename,
+                               as_attachment=True, download_name=filename)
 
 
 # ---------------------------------------------------------------------------
-# Single-page app
+# Single-page UI
 # ---------------------------------------------------------------------------
 
 @app.get("/")
@@ -104,7 +219,7 @@ def index():
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>YouTube Audio Downloader</title>
+  <title>YouTube → Podcast</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -113,96 +228,130 @@ def index():
       background: #0f0f0f;
       color: #e8e8e8;
       min-height: 100vh;
+      padding: 2rem 1rem 4rem;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
-      padding: 2rem 1rem;
     }
 
-    .card {
-      background: #1a1a1a;
-      border: 1px solid #2e2e2e;
-      border-radius: 16px;
-      padding: 2.5rem 2rem;
-      width: 100%;
-      max-width: 560px;
-      box-shadow: 0 8px 40px rgba(0,0,0,.5);
-    }
+    .wrap { width: 100%; max-width: 600px; }
 
-    .logo {
+    /* ── Header ── */
+    .header {
       display: flex;
       align-items: center;
       gap: .75rem;
-      margin-bottom: 2rem;
+      margin-bottom: 1.75rem;
     }
 
-    .logo svg { flex-shrink: 0; }
-
-    h1 {
-      font-size: 1.4rem;
-      font-weight: 700;
-      letter-spacing: -.02em;
-      color: #fff;
-    }
-
+    h1 { font-size: 1.35rem; font-weight: 700; color: #fff; letter-spacing: -.02em; }
     h1 span { color: #ff4444; }
 
+    /* ── Cards ── */
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #2e2e2e;
+      border-radius: 14px;
+      padding: 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .card-title {
+      font-size: .72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: #666;
+      margin-bottom: 1rem;
+    }
+
+    /* ── Feed URL ── */
+    .feed-row {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      background: #111;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      padding: .55rem .75rem;
+    }
+
+    .feed-row span {
+      flex: 1;
+      font-family: monospace;
+      font-size: .82rem;
+      color: #aaa;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .copy-btn {
+      background: #2a2a2a;
+      border: none;
+      border-radius: 6px;
+      color: #ccc;
+      cursor: pointer;
+      font-size: .75rem;
+      padding: .3rem .65rem;
+      white-space: nowrap;
+      transition: background .15s;
+    }
+
+    .copy-btn:hover { background: #333; color: #fff; }
+
+    .feed-hint {
+      font-size: .75rem;
+      color: #555;
+      margin-top: .6rem;
+    }
+
+    /* ── Input row ── */
     label {
       display: block;
-      font-size: .8rem;
-      font-weight: 600;
+      font-size: .72rem;
+      font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: .06em;
-      color: #888;
+      letter-spacing: .1em;
+      color: #666;
       margin-bottom: .5rem;
     }
 
-    .input-row {
-      display: flex;
-      gap: .5rem;
-    }
+    .input-row { display: flex; gap: .5rem; }
 
-    input[type=text] {
+    input[type=text], input[type=password] {
       flex: 1;
       background: #111;
-      border: 1px solid #333;
+      border: 1px solid #2e2e2e;
       border-radius: 10px;
       color: #e8e8e8;
-      font-size: .95rem;
-      padding: .65rem 1rem;
+      font-size: .9rem;
+      padding: .6rem .9rem;
       outline: none;
       transition: border-color .15s;
     }
 
-    input[type=text]:focus { border-color: #ff4444; }
-    input[type=text]::placeholder { color: #555; }
+    input:focus { border-color: #ff4444; }
+    input::placeholder { color: #444; }
 
-    button#downloadBtn {
+    .btn-red {
       background: #ff4444;
       border: none;
       border-radius: 10px;
       color: #fff;
       cursor: pointer;
-      font-size: .95rem;
+      font-size: .9rem;
       font-weight: 600;
-      padding: .65rem 1.4rem;
+      padding: .6rem 1.3rem;
       transition: background .15s, opacity .15s;
       white-space: nowrap;
     }
 
-    button#downloadBtn:hover:not(:disabled) { background: #e03333; }
-    button#downloadBtn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-red:hover:not(:disabled) { background: #e03333; }
+    .btn-red:disabled { opacity: .45; cursor: not-allowed; }
 
-    /* Status area */
-    #status {
-      margin-top: 1.75rem;
-      display: none;
-      background: #111;
-      border: 1px solid #2a2a2a;
-      border-radius: 14px;
-      padding: 1.25rem 1.25rem 1rem;
-    }
+    /* ── Progress ── */
+    #progressCard { display: none; }
 
     .phase-label {
       font-size: .72rem;
@@ -210,379 +359,458 @@ def index():
       text-transform: uppercase;
       letter-spacing: .1em;
       color: #ff4444;
-      margin-bottom: .6rem;
+      margin-bottom: .5rem;
     }
 
-    /* big percentage */
     .pct-row {
       display: flex;
       align-items: flex-end;
-      gap: .4rem;
-      margin-bottom: .75rem;
+      gap: .3rem;
+      margin-bottom: .65rem;
     }
 
-    .pct-number {
-      font-size: 2.6rem;
+    .pct-num {
+      font-size: 2.4rem;
       font-weight: 800;
       line-height: 1;
       color: #fff;
-      letter-spacing: -.04em;
       font-variant-numeric: tabular-nums;
-      transition: color .2s;
     }
 
-    .pct-symbol {
-      font-size: 1.1rem;
-      font-weight: 600;
-      color: #666;
-      padding-bottom: .3rem;
-    }
+    .pct-sym { font-size: 1rem; color: #555; padding-bottom: .25rem; }
 
-    /* bar */
-    .progress-bar-track {
+    .bar-track {
       background: #222;
       border-radius: 999px;
       height: 10px;
       overflow: hidden;
-      margin-bottom: .85rem;
-      position: relative;
+      margin-bottom: .75rem;
     }
 
-    .progress-bar-fill {
+    .bar-fill {
       height: 100%;
       border-radius: 999px;
       background: linear-gradient(90deg, #c0392b, #ff4444, #ff6b6b);
       width: 0%;
-      transition: width .4s cubic-bezier(.4,0,.2,1);
+      transition: width .35s cubic-bezier(.4,0,.2,1);
       position: relative;
     }
 
-    /* shimmer overlay */
-    .progress-bar-fill::after {
+    .bar-fill::after {
       content: '';
       position: absolute;
       inset: 0;
-      background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.18) 50%, transparent 100%);
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,.18), transparent);
       animation: shimmer 1.6s linear infinite;
     }
 
-    @keyframes shimmer {
-      0%   { transform: translateX(-100%); }
-      100% { transform: translateX(100%); }
-    }
+    @keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
 
-    .progress-bar-fill.indeterminate {
-      width: 35% !important;
-      animation: slide 1.4s ease-in-out infinite;
-    }
+    .bar-fill.spin { width: 35% !important; animation: slide 1.4s ease-in-out infinite; }
+    .bar-fill.spin::after { display: none; }
+    @keyframes slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(360%); } }
 
-    .progress-bar-fill.indeterminate::after { display: none; }
+    .pills { display: flex; gap: .4rem; flex-wrap: wrap; }
 
-    @keyframes slide {
-      0%   { transform: translateX(-120%); }
-      100% { transform: translateX(360%); }
-    }
-
-    /* stats row */
-    .stats-row {
-      display: flex;
-      gap: .5rem;
-      flex-wrap: wrap;
-    }
-
-    .stat-pill {
+    .pill {
       display: flex;
       align-items: center;
-      gap: .35rem;
+      gap: .3rem;
       background: #1c1c1c;
       border: 1px solid #2e2e2e;
       border-radius: 999px;
-      padding: .3rem .75rem;
-      font-size: .78rem;
+      padding: .25rem .65rem;
+      font-size: .75rem;
       color: #bbb;
     }
 
-    .stat-pill svg { flex-shrink: 0; opacity: .6; }
-    .stat-pill strong { color: #fff; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .pill strong { color: #fff; font-variant-numeric: tabular-nums; }
 
-    /* Result card */
-    #result {
-      display: none;
-      margin-top: 1.5rem;
-      background: #111;
-      border: 1px solid #2a2a2a;
-      border-radius: 12px;
-      padding: 1rem 1.25rem;
-    }
+    /* ── Result ── */
+    #resultCard { display: none; }
 
-    #result .thumb-row {
-      display: flex;
-      gap: 1rem;
-      align-items: center;
-      margin-bottom: 1rem;
-    }
+    .thumb-row { display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; }
 
-    #result img {
-      width: 72px;
-      height: 72px;
+    .thumb-row img {
+      width: 64px; height: 64px;
       object-fit: cover;
       border-radius: 8px;
-      flex-shrink: 0;
       background: #222;
+      flex-shrink: 0;
     }
 
-    #result .meta { overflow: hidden; }
+    .ep-meta strong { display: block; font-size: .95rem; color: #fff; }
+    .ep-meta span { font-size: .78rem; color: #666; }
 
-    #result .meta strong {
-      display: block;
-      font-size: .95rem;
-      color: #fff;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
+    .result-btns { display: flex; gap: .5rem; }
 
-    #result .meta span {
-      font-size: .8rem;
-      color: #777;
-    }
-
-    #result a.dl-btn {
+    .btn-green {
+      flex: 1;
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: .5rem;
+      gap: .4rem;
       background: #1db954;
       border-radius: 10px;
       color: #fff;
       font-weight: 600;
-      font-size: .9rem;
-      padding: .65rem 1rem;
+      font-size: .85rem;
+      padding: .6rem .9rem;
       text-decoration: none;
       transition: background .15s;
     }
 
-    #result a.dl-btn:hover { background: #17a349; }
+    .btn-green:hover { background: #17a349; }
 
-    #errorMsg {
+    /* ── Error ── */
+    .error-box {
       display: none;
-      margin-top: 1.25rem;
+      margin-top: 1rem;
       background: #2a1111;
       border: 1px solid #5c2020;
       border-radius: 10px;
       color: #ff7070;
-      font-size: .85rem;
-      padding: .75rem 1rem;
+      font-size: .82rem;
+      padding: .7rem 1rem;
     }
 
-    footer {
-      margin-top: 1.5rem;
-      font-size: .75rem;
-      color: #444;
-      text-align: center;
+    /* ── Episodes list ── */
+    .ep-row {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      padding: .65rem 0;
+      border-bottom: 1px solid #222;
+    }
+
+    .ep-row:last-child { border-bottom: none; }
+
+    .ep-row img {
+      width: 44px; height: 44px;
+      border-radius: 6px;
+      object-fit: cover;
+      background: #222;
+      flex-shrink: 0;
+    }
+
+    .ep-row .info { flex: 1; overflow: hidden; }
+    .ep-row .info strong { display: block; font-size: .85rem; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ep-row .info span { font-size: .73rem; color: #555; }
+
+    .ep-row a {
+      font-size: .72rem;
+      color: #ff4444;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .empty { color: #444; font-size: .85rem; text-align: center; padding: 1.5rem 0; }
+
+    /* ── Setup overlay ── */
+    #setupCard { display: none; }
+
+    .setup-field { margin-bottom: 1rem; }
+    .setup-field label { margin-bottom: .4rem; }
+
+    .setup-hint {
+      font-size: .72rem;
+      color: #555;
+      margin-top: .35rem;
     }
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="logo">
-      <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
-        <rect width="36" height="36" rx="10" fill="#ff4444"/>
-        <path d="M14 11.5l11 6.5-11 6.5V11.5z" fill="white"/>
-      </svg>
-      <h1><span>YouTube</span> Audio Downloader</h1>
-    </div>
+<div class="wrap">
 
-    <label for="urlInput">YouTube URL</label>
-    <div class="input-row">
-      <input type="text" id="urlInput"
-             placeholder="https://www.youtube.com/watch?v=..."
-             autocomplete="off" spellcheck="false"/>
-      <button id="downloadBtn">Download</button>
-    </div>
-
-    <div id="status">
-      <div class="phase-label" id="phaseLabel">Fetching video info</div>
-      <div class="pct-row">
-        <span class="pct-number" id="pctNumber">0</span>
-        <span class="pct-symbol">%</span>
-      </div>
-      <div class="progress-bar-track">
-        <div class="progress-bar-fill indeterminate" id="progressBar"></div>
-      </div>
-      <div class="stats-row" id="statsRow">
-        <div class="stat-pill" id="pillSpeed" style="display:none">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-            <path d="M6 1a5 5 0 1 1 0 10A5 5 0 0 1 6 1zm0 2v3l2 1" stroke="#ff4444" stroke-width="1.4" stroke-linecap="round"/>
-          </svg>
-          Speed: <strong id="speedVal">—</strong>
-        </div>
-        <div class="stat-pill" id="pillEta" style="display:none">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-            <path d="M6 2v4l2.5 2.5M6 1a5 5 0 1 1 0 10A5 5 0 0 1 6 1z" stroke="#aaa" stroke-width="1.4" stroke-linecap="round"/>
-          </svg>
-          Remaining: <strong id="etaVal">—</strong>
-        </div>
-      </div>
-    </div>
-
-    <div id="result">
-      <div class="thumb-row">
-        <img id="thumbnail" src="" alt="thumbnail"/>
-        <div class="meta">
-          <strong id="trackTitle"></strong>
-          <span id="trackMeta"></span>
-        </div>
-      </div>
-      <a class="dl-btn" id="dlLink" href="#" download>
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-          <path d="M8 1v9m0 0L5 7m3 3 3-3M2 13h12" stroke="white" stroke-width="1.6"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        Save MP3
-      </a>
-    </div>
-
-    <div id="errorMsg"></div>
+  <!-- Header -->
+  <div class="header">
+    <svg width="34" height="34" viewBox="0 0 34 34" fill="none">
+      <rect width="34" height="34" rx="9" fill="#ff4444"/>
+      <path d="M13 11l10 6-10 6V11z" fill="white"/>
+    </svg>
+    <h1><span>YouTube</span> → Apple Podcasts</h1>
   </div>
 
-  <footer>Supports any public YouTube video &nbsp;·&nbsp; Output: MP3 VBR</footer>
+  <!-- Setup card (shown when not configured) -->
+  <div class="card" id="setupCard">
+    <div class="card-title">First-time Setup</div>
+    <p style="font-size:.83rem;color:#777;margin-bottom:1.25rem">
+      Get your free Internet Archive S3 keys at
+      <a href="https://archive.org/account/s3.php" target="_blank" style="color:#ff4444">archive.org/account/s3.php</a>
+    </p>
 
-  <script>
-    const urlInput    = document.getElementById('urlInput');
-    const downloadBtn = document.getElementById('downloadBtn');
-    const statusEl    = document.getElementById('status');
-    const resultEl    = document.getElementById('result');
-    const errorMsg    = document.getElementById('errorMsg');
-    const progressBar = document.getElementById('progressBar');
-    const pctNumber   = document.getElementById('pctNumber');
-    const phaseLabel  = document.getElementById('phaseLabel');
-    const pillSpeed   = document.getElementById('pillSpeed');
-    const pillEta     = document.getElementById('pillEta');
-    const speedVal    = document.getElementById('speedVal');
-    const etaVal      = document.getElementById('etaVal');
+    <div class="setup-field">
+      <label>Podcast Name</label>
+      <input type="text" id="cfgName" placeholder="My YouTube Podcast"/>
+    </div>
 
-    function setLoading(on) {
-      downloadBtn.disabled = on;
-      statusEl.style.display = on ? 'block' : 'none';
-    }
+    <div class="setup-field">
+      <label>Podcast ID <small style="text-transform:none;letter-spacing:0;font-weight:400;color:#555">(unique slug, no spaces)</small></label>
+      <input type="text" id="cfgId" placeholder="my-youtube-podcast"/>
+      <div class="setup-hint">Used as the Archive.org item prefix. Must be globally unique.</div>
+    </div>
 
-    function showError(msg) {
-      errorMsg.textContent = msg;
-      errorMsg.style.display = 'block';
-    }
+    <div class="setup-field">
+      <label>Archive.org Access Key</label>
+      <input type="text" id="cfgAccess" placeholder="Access key from archive.org/account/s3.php"/>
+    </div>
 
-    function hideError() {
-      errorMsg.style.display = 'none';
-    }
+    <div class="setup-field">
+      <label>Archive.org Secret Key</label>
+      <input type="password" id="cfgSecret" placeholder="Secret key"/>
+    </div>
 
-    function showResult(job) {
-      document.getElementById('thumbnail').src = job.thumbnail || '';
-      document.getElementById('trackTitle').textContent = job.title;
-      const mins = Math.floor(job.duration / 60);
-      const secs = String(job.duration % 60).padStart(2, '0');
-      document.getElementById('trackMeta').textContent =
-        `${job.uploader}  ·  ${mins}:${secs}`;
-      const link = document.getElementById('dlLink');
-      link.href = `/api/file/${encodeURIComponent(job.filename)}`;
-      link.download = job.filename;
-      resultEl.style.display = 'block';
-    }
+    <button class="btn-red" id="saveSetupBtn">Save & Continue</button>
+    <div class="error-box" id="setupError"></div>
+  </div>
 
-    function setProgress(percent, phase, speed, eta) {
-      if (percent > 0) {
-        progressBar.classList.remove('indeterminate');
-        progressBar.style.width = percent + '%';
-        pctNumber.textContent = Math.floor(percent);
-      } else {
-        progressBar.classList.add('indeterminate');
-        progressBar.style.width = '';
-        pctNumber.textContent = '0';
-      }
+  <!-- Feed URL card -->
+  <div class="card" id="feedCard" style="display:none">
+    <div class="card-title">Your Podcast Feed</div>
+    <div class="feed-row">
+      <span id="feedUrl"></span>
+      <button class="copy-btn" onclick="copyFeed()">Copy</button>
+    </div>
+    <p class="feed-hint">Open Apple Podcasts → File → Follow a Show by URL → paste this URL.</p>
+  </div>
 
-      phaseLabel.textContent = phase;
+  <!-- Download card -->
+  <div class="card" id="downloadCard" style="display:none">
+    <div class="card-title">Add Episode from YouTube</div>
+    <label for="urlInput">YouTube URL</label>
+    <div class="input-row">
+      <input type="text" id="urlInput" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" spellcheck="false"/>
+      <button class="btn-red" id="dlBtn">Download</button>
+    </div>
+    <div class="error-box" id="dlError"></div>
+  </div>
 
-      if (speed) {
-        pillSpeed.style.display = 'flex';
-        speedVal.textContent = speed;
-      } else {
-        pillSpeed.style.display = 'none';
-      }
+  <!-- Progress card -->
+  <div class="card" id="progressCard">
+    <div class="phase-label" id="phaseLabel">Starting…</div>
+    <div class="pct-row">
+      <span class="pct-num" id="pctNum">0</span>
+      <span class="pct-sym">%</span>
+    </div>
+    <div class="bar-track">
+      <div class="bar-fill spin" id="barFill"></div>
+    </div>
+    <div class="pills" id="pills"></div>
+  </div>
 
-      if (eta) {
-        pillEta.style.display = 'flex';
-        etaVal.textContent = eta;
-      } else {
-        pillEta.style.display = 'none';
-      }
-    }
+  <!-- Result card -->
+  <div class="card" id="resultCard">
+    <div class="card-title">Added to Podcast Feed</div>
+    <div class="thumb-row">
+      <img id="rThumb" src="" alt=""/>
+      <div class="ep-meta">
+        <strong id="rTitle"></strong>
+        <span id="rMeta"></span>
+      </div>
+    </div>
+    <div class="result-btns">
+      <a class="btn-green" id="rIaLink" href="#" target="_blank">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1v8m0 0L4 6m3 3 3-3M1 12h12" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Open on Archive.org
+      </a>
+    </div>
+  </div>
 
-    async function poll(jobId) {
-      setProgress(0, 'Fetching video info…', '', '');
+  <!-- Episodes list -->
+  <div class="card" id="episodesCard" style="display:none">
+    <div class="card-title">All Episodes</div>
+    <div id="epList"></div>
+  </div>
 
-      const interval = setInterval(async () => {
-        try {
-          const res = await fetch(`/api/status/${jobId}`);
-          const job = await res.json();
+</div><!-- /wrap -->
 
-          if (job.status === 'done') {
-            clearInterval(interval);
-            setLoading(false);
-            statusEl.style.display = 'none';
-            showResult(job);
-          } else if (job.status === 'error') {
-            clearInterval(interval);
-            setLoading(false);
-            showError('Download failed: ' + job.error);
-          } else if (job.phase === 'downloading') {
-            const pct = job.percent || 0;
-            const eta = job.eta ? job.eta : '';
-            setProgress(pct, 'Downloading audio…', job.speed || '', eta);
-          } else if (job.phase === 'converting') {
-            const pct = job.percent || 0;
-            setProgress(pct, 'Converting to MP3…', '', '');
-          } else {
-            setProgress(0, 'Fetching video info…', '', '');
-          }
-        } catch {
-          clearInterval(interval);
-          setLoading(false);
-          showError('Lost connection to server.');
-        }
-      }, 500);
-    }
+<script>
+const $ = id => document.getElementById(id);
 
-    downloadBtn.addEventListener('click', async () => {
-      const url = urlInput.value.trim();
-      if (!url) { urlInput.focus(); return; }
+// ── Init ────────────────────────────────────────────────────────────────────
+async function init() {
+  const res  = await fetch('/api/config');
+  const cfg  = await res.json();
 
-      hideError();
-      resultEl.style.display = 'none';
-      setLoading(true);
+  if (!cfg.configured) {
+    $('setupCard').style.display = 'block';
+  } else {
+    showApp(cfg.podcast_name);
+  }
+}
 
-      try {
-        const res = await fetch('/api/download', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          setLoading(false);
-          showError(data.error || 'Unknown error');
-          return;
-        }
-        poll(data.job_id);
-      } catch (err) {
-        setLoading(false);
-        showError('Could not reach server: ' + err.message);
-      }
+function showApp(podcastName) {
+  const feedUrl = `${location.origin}/feed.xml`;
+  $('feedUrl').textContent = feedUrl;
+  $('feedCard').style.display    = 'block';
+  $('downloadCard').style.display = 'block';
+  loadEpisodes();
+}
+
+// ── Setup ───────────────────────────────────────────────────────────────────
+$('cfgName').addEventListener('input', () => {
+  if (!$('cfgId').value) {
+    $('cfgId').value = $('cfgName').value.toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+  }
+});
+
+$('saveSetupBtn').addEventListener('click', async () => {
+  const err = $('setupError');
+  err.style.display = 'none';
+
+  const body = {
+    podcast_name:  $('cfgName').value.trim(),
+    podcast_id:    $('cfgId').value.trim(),
+    ia_access_key: $('cfgAccess').value.trim(),
+    ia_secret_key: $('cfgSecret').value.trim(),
+  };
+
+  if (!body.podcast_name || !body.podcast_id || !body.ia_access_key || !body.ia_secret_key) {
+    err.textContent = 'All fields are required.';
+    err.style.display = 'block';
+    return;
+  }
+
+  const res = await fetch('/api/setup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+
+  if (!res.ok) { err.textContent = data.error; err.style.display = 'block'; return; }
+  $('setupCard').style.display = 'none';
+  showApp(body.podcast_name);
+});
+
+// ── Feed URL copy ────────────────────────────────────────────────────────────
+function copyFeed() {
+  navigator.clipboard.writeText($('feedUrl').textContent);
+  const btn = document.querySelector('.copy-btn');
+  btn.textContent = 'Copied!';
+  setTimeout(() => btn.textContent = 'Copy', 2000);
+}
+
+// ── Download flow ────────────────────────────────────────────────────────────
+$('dlBtn').addEventListener('click', startDownload);
+$('urlInput').addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
+
+async function startDownload() {
+  const url = $('urlInput').value.trim();
+  if (!url) { $('urlInput').focus(); return; }
+
+  $('dlError').style.display = 'none';
+  $('resultCard').style.display = 'none';
+  $('dlBtn').disabled = true;
+  setProgress(0, 'Fetching video info…', '', '');
+  $('progressCard').style.display = 'block';
+
+  try {
+    const res = await fetch('/api/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
     });
+    const data = await res.json();
+    if (!res.ok) { stopProgress(data.error); return; }
+    poll(data.job_id);
+  } catch (e) {
+    stopProgress('Could not reach server: ' + e.message);
+  }
+}
 
-    urlInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') downloadBtn.click();
-    });
-  </script>
+function stopProgress(errMsg) {
+  $('dlBtn').disabled = false;
+  $('progressCard').style.display = 'none';
+  if (errMsg) { $('dlError').textContent = errMsg; $('dlError').style.display = 'block'; }
+}
+
+// ── Polling ──────────────────────────────────────────────────────────────────
+async function poll(jobId) {
+  const iv = setInterval(async () => {
+    try {
+      const res = await fetch('/api/status/' + jobId);
+      const job = await res.json();
+
+      if (job.status === 'done') {
+        clearInterval(iv);
+        stopProgress(null);
+        showResult(job);
+        loadEpisodes();
+      } else if (job.status === 'error') {
+        clearInterval(iv);
+        stopProgress('Error: ' + job.error);
+      } else if (job.phase === 'downloading') {
+        setProgress(job.percent || 0, 'Downloading audio…', job.speed || '', job.eta || '');
+      } else if (job.phase === 'converting') {
+        setProgress(job.percent || 0, 'Converting to MP3…', '', '');
+      } else if (job.phase === 'uploading') {
+        setProgress(job.percent || 0, 'Uploading to Archive.org…', '', '');
+      } else {
+        setProgress(0, 'Fetching video info…', '', '');
+      }
+    } catch {
+      clearInterval(iv);
+      stopProgress('Lost connection to server.');
+    }
+  }, 500);
+}
+
+// ── Progress bar ─────────────────────────────────────────────────────────────
+function setProgress(pct, phase, speed, eta) {
+  const bar = $('barFill');
+  if (pct > 0) {
+    bar.classList.remove('spin');
+    bar.style.width = pct + '%';
+    $('pctNum').textContent = Math.floor(pct);
+  } else {
+    bar.classList.add('spin');
+    bar.style.width = '';
+    $('pctNum').textContent = '0';
+  }
+  $('phaseLabel').textContent = phase;
+
+  const pills = $('pills');
+  pills.innerHTML = '';
+  if (speed) pills.innerHTML += `<div class="pill">Speed <strong>${speed}</strong></div>`;
+  if (eta)   pills.innerHTML += `<div class="pill">ETA <strong>${eta}</strong></div>`;
+}
+
+// ── Result ───────────────────────────────────────────────────────────────────
+function showResult(job) {
+  $('rThumb').src = job.thumbnail || '';
+  $('rTitle').textContent = job.title;
+  const m = Math.floor(job.duration / 60), s = String(job.duration % 60).padStart(2,'0');
+  $('rMeta').textContent = `${job.uploader}  ·  ${m}:${s}`;
+  $('rIaLink').href = job.ia_url;
+  $('resultCard').style.display = 'block';
+  $('urlInput').value = '';
+}
+
+// ── Episodes list ─────────────────────────────────────────────────────────────
+async function loadEpisodes() {
+  const res = await fetch('/api/episodes');
+  const eps = await res.json();
+
+  if (!eps.length) return;
+  $('episodesCard').style.display = 'block';
+
+  $('epList').innerHTML = [...eps].reverse().map(ep => {
+    const m = Math.floor(ep.duration / 60), s = String(ep.duration % 60).padStart(2,'0');
+    return `<div class="ep-row">
+      <img src="${ep.thumbnail}" alt="" onerror="this.style.display='none'"/>
+      <div class="info">
+        <strong>${ep.title}</strong>
+        <span>${ep.uploader} · ${m}:${s}</span>
+      </div>
+      <a href="${ep.ia_url}" target="_blank">Archive.org ↗</a>
+    </div>`;
+  }).join('');
+}
+
+init();
+</script>
 </body>
 </html>"""
 

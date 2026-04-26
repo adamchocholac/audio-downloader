@@ -6,9 +6,13 @@ __pycache__/
 
 # Downloads (user-generated content)
 downloads/
+episodes.json
 
 # Environment overrides
 .env
+
+# User config (contains credentials)
+config.json
 
 # macOS
 .DS_Store
