@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Downloads (user-generated content)
+downloads/
+
+# Environment overrides
+.env
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
