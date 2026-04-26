@@ -6,7 +6,6 @@ __pycache__/
 
 # Downloads (user-generated content)
 downloads/
-episodes.json
 
 # Environment overrides
 .env

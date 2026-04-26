@@ -6,16 +6,17 @@ Open: http://localhost:5000
 
 On first run, a setup form asks for:
   - Internet Archive S3 keys  (archive.org/account/s3.php — free)
-  - Fly.io feed server URL    (your deployed server.py URL)
-  - Fly.io API token          (the API_TOKEN secret you set on Fly.io)
+  - GitHub Personal Access Token (github.com/settings/tokens — needs Contents: Write)
+  - GitHub repo  (e.g. adamchocholac/audio-downloader)
 
 Flow for each video:
   1. Download audio from YouTube
   2. Convert to MP3
   3. Upload to Internet Archive (free, permanent hosting)
-  4. Push episode metadata to Fly.io feed server → appears in Apple Podcasts
+  4. Commit episodes.json + feed.xml to GitHub → live in Apple Podcasts via GitHub Pages
 """
 
+import base64
 import json
 import re
 import threading
@@ -29,6 +30,7 @@ from flask import Flask, jsonify, request, send_from_directory, abort
 
 from downloader import download_audio, DOWNLOADS_DIR
 from uploader import upload_to_archive
+from feed import build_rss
 
 app  = Flask(__name__)
 PORT = int(os.environ.get("PORT", 5000))
@@ -40,7 +42,7 @@ jobs_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Config helpers
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
@@ -57,13 +59,89 @@ def save_config(cfg: dict) -> None:
 
 def config_ok() -> bool:
     c = load_config()
-    return bool(c.get("ia_access_key") and c.get("ia_secret_key")
-                and c.get("fly_url") and c.get("fly_token") and c.get("podcast_id"))
+    return bool(
+        c.get("ia_access_key") and c.get("ia_secret_key")
+        and c.get("github_token") and c.get("github_repo")
+        and c.get("podcast_id")
+    )
+
+
+def _pages_url(github_repo: str) -> str:
+    owner, repo = github_repo.split("/", 1)
+    return f"https://{owner}.github.io/{repo}"
 
 
 def _extract_video_id(url: str) -> str:
     m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
     return m.group(1) if m else uuid.uuid4().hex[:8]
+
+
+# ---------------------------------------------------------------------------
+# GitHub Pages push
+# ---------------------------------------------------------------------------
+
+def _push_to_github(episode: dict, cfg: dict) -> None:
+    owner, repo = cfg["github_repo"].split("/", 1)
+    token       = cfg["github_token"]
+    headers     = {
+        "Authorization":        f"Bearer {token}",
+        "Accept":               "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base_url = f"https://api.github.com/repos/{owner}/{repo}/contents"
+
+    # Load current episodes.json from GitHub
+    episodes:     list[dict] = []
+    episodes_sha: str | None = None
+    r = http_requests.get(f"{base_url}/episodes.json", headers=headers, timeout=15)
+    if r.status_code == 200:
+        data         = r.json()
+        episodes_sha = data["sha"]
+        episodes     = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+
+    # Add episode (deduplicate by filename)
+    if not any(e.get("filename") == episode["filename"] for e in episodes):
+        episodes.append(episode)
+
+    # Generate RSS XML
+    feed_url  = f"{_pages_url(cfg['github_repo'])}/feed.xml"
+    rss_bytes = build_rss(
+        feed_url     = feed_url,
+        podcast_name = cfg.get("podcast_name") or "My YouTube Podcast",
+        podcast_desc = cfg.get("podcast_desc") or "Audio downloaded from YouTube.",
+        episodes     = episodes,
+    )
+
+    # Commit episodes.json
+    episodes_payload: dict = {
+        "message": f"Add episode: {episode['title']}",
+        "content": base64.b64encode(
+            json.dumps(episodes, indent=2, ensure_ascii=False).encode()
+        ).decode(),
+    }
+    if episodes_sha:
+        episodes_payload["sha"] = episodes_sha
+    http_requests.put(
+        f"{base_url}/episodes.json",
+        json=episodes_payload, headers=headers, timeout=15,
+    ).raise_for_status()
+
+    # Commit feed.xml
+    feed_sha: str | None = None
+    r = http_requests.get(f"{base_url}/feed.xml", headers=headers, timeout=15)
+    if r.status_code == 200:
+        feed_sha = r.json()["sha"]
+
+    feed_payload: dict = {
+        "message": f"Update feed: {episode['title']}",
+        "content": base64.b64encode(rss_bytes).decode(),
+    }
+    if feed_sha:
+        feed_payload["sha"] = feed_sha
+    http_requests.put(
+        f"{base_url}/feed.xml",
+        json=feed_payload, headers=headers, timeout=15,
+    ).raise_for_status()
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +157,11 @@ def _run_job(job_id: str, url: str) -> None:
                 jobs[job_id].update(info)
 
     try:
-        # ── Phase 1 + 2: download & convert ──────────────────────────────
-        result = download_audio(url, on_progress=progress)
+        # Phase 1 + 2: download & convert
+        result   = download_audio(url, on_progress=progress)
         mp3_path = DOWNLOADS_DIR / result.filename
 
-        # ── Phase 3: upload to Internet Archive ──────────────────────────
+        # Phase 3: upload to Internet Archive
         video_id   = _extract_video_id(url)
         identifier = f"{cfg['podcast_id']}-{video_id}"
 
@@ -96,7 +174,8 @@ def _run_job(job_id: str, url: str) -> None:
             on_progress = progress,
         )
 
-        # ── Phase 4: push to Fly.io feed server ──────────────────────────
+        # Phase 4: push to GitHub Pages
+        progress({"phase": "publishing", "percent": 95})
         episode = {
             "title":       result.title,
             "filename":    result.filename,
@@ -107,25 +186,17 @@ def _run_job(job_id: str, url: str) -> None:
             "description": result.title,
             "published":   datetime.now(timezone.utc).isoformat(),
         }
-
-        fly_url   = cfg["fly_url"].rstrip("/")
-        fly_token = cfg["fly_token"]
-        http_requests.post(
-            f"{fly_url}/api/episodes",
-            json    = episode,
-            headers = {"Authorization": f"Bearer {fly_token}"},
-            timeout = 15,
-        ).raise_for_status()
+        _push_to_github(episode, cfg)
 
         with jobs_lock:
             jobs[job_id] = {
-                "status":   "done",
-                "title":    result.title,
-                "filename": result.filename,
-                "ia_url":   ia_url,
-                "duration": result.duration,
-                "uploader": result.uploader,
-                "thumbnail":result.thumbnail,
+                "status":    "done",
+                "title":     result.title,
+                "filename":  result.filename,
+                "ia_url":    ia_url,
+                "duration":  result.duration,
+                "uploader":  result.uploader,
+                "thumbnail": result.thumbnail,
             }
 
     except Exception as exc:
@@ -139,21 +210,25 @@ def _run_job(job_id: str, url: str) -> None:
 
 @app.post("/api/setup")
 def api_setup():
-    data = request.get_json(force=True, silent=True) or {}
-    for key in ["ia_access_key", "ia_secret_key", "podcast_id", "fly_url", "fly_token"]:
+    data     = request.get_json(force=True, silent=True) or {}
+    required = ["ia_access_key", "ia_secret_key", "podcast_id", "github_token", "github_repo"]
+    for key in required:
         if not data.get(key, "").strip():
             return jsonify({"error": f"Missing: {key}"}), 400
-    save_config({k: data[k].strip() for k in
-                 ["ia_access_key", "ia_secret_key", "podcast_id", "fly_url", "fly_token"]})
+    all_keys = required + ["podcast_name", "podcast_desc"]
+    save_config({k: data[k].strip() for k in all_keys if data.get(k, "").strip()})
     return jsonify({"ok": True})
 
 
 @app.get("/api/config-status")
 def api_config_status():
-    c = load_config()
+    c        = load_config()
+    feed_url = ""
+    if c.get("github_repo"):
+        feed_url = f"{_pages_url(c['github_repo'])}/feed.xml"
     return jsonify({
         "configured": config_ok(),
-        "fly_url":    c.get("fly_url", ""),
+        "feed_url":   feed_url,
     })
 
 
@@ -187,8 +262,10 @@ def serve_file(filename: str):
     path = DOWNLOADS_DIR / filename
     if not path.exists():
         abort(404)
-    return send_from_directory(str(DOWNLOADS_DIR.resolve()), filename,
-                               as_attachment=True, download_name=filename)
+    return send_from_directory(
+        str(DOWNLOADS_DIR.resolve()), filename,
+        as_attachment=True, download_name=filename,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +302,9 @@ def index():
     .btn-red:hover:not(:disabled){background:#e03333}
     .btn-red:disabled{opacity:.45;cursor:not-allowed}
     .hint{font-size:.72rem;color:#555;margin-top:.35rem;line-height:1.5}
-    .hint a{color:#ff4444}
+    .hint a{color:#ff4444;text-decoration:none}
+    .hint a:hover{text-decoration:underline}
+    .section-sep{height:1px;background:#222;margin:.75rem 0}
 
     /* feed pill */
     .feed-row{display:flex;align-items:center;gap:.5rem;background:#111;border:1px solid #2a2a2a;border-radius:10px;padding:.55rem .75rem;margin-bottom:.5rem}
@@ -275,28 +354,49 @@ def index():
   <!-- Setup -->
   <div class="card" id="setupCard" style="display:none">
     <div class="card-title">Setup</div>
+
+    <div class="field">
+      <label>Podcast Name</label>
+      <input type="text" id="cfgPodcastName" placeholder="My YouTube Podcast" value="My YouTube Podcast"/>
+    </div>
+    <div class="field">
+      <label>Podcast Description</label>
+      <input type="text" id="cfgPodcastDesc" placeholder="Audio downloaded from YouTube." value="Audio downloaded from YouTube."/>
+    </div>
     <div class="field">
       <label>Podcast ID <small style="text-transform:none;letter-spacing:0;font-weight:400;color:#555">(unique slug)</small></label>
       <input type="text" id="cfgPodcastId" placeholder="my-podcast"/>
-      <div class="hint">Used as the Archive.org item prefix. Must be globally unique.</div>
+      <div class="hint">Used as the Archive.org item prefix, e.g. <code>my-podcast-abc123</code>. Must be globally unique.</div>
     </div>
+
+    <div class="section-sep"></div>
+
     <div class="field">
       <label>Archive.org Access Key</label>
       <input type="text" id="cfgIaAccess" placeholder="Get from archive.org/account/s3.php"/>
+      <div class="hint"><a href="https://archive.org/account/s3.php" target="_blank">archive.org/account/s3.php</a> &rarr; Generate new keys</div>
     </div>
     <div class="field">
       <label>Archive.org Secret Key</label>
       <input type="password" id="cfgIaSecret"/>
     </div>
+
+    <div class="section-sep"></div>
+
     <div class="field">
-      <label>Fly.io Feed Server URL</label>
-      <input type="text" id="cfgFlyUrl" placeholder="https://your-app.fly.dev"/>
-      <div class="hint">The URL of your deployed <code>server.py</code> on Fly.io.</div>
+      <label>GitHub Repository</label>
+      <input type="text" id="cfgGhRepo" placeholder="username/repo-name"/>
+      <div class="hint">e.g. <code>adamchocholac/audio-downloader</code></div>
     </div>
     <div class="field">
-      <label>Fly.io API Token</label>
-      <input type="password" id="cfgFlyToken" placeholder="The API_TOKEN secret set on Fly.io"/>
+      <label>GitHub Personal Access Token</label>
+      <input type="password" id="cfgGhToken" placeholder="github_pat_..."/>
+      <div class="hint">
+        <a href="https://github.com/settings/tokens?type=beta" target="_blank">github.com/settings/tokens</a>
+        &rarr; Fine-grained token &rarr; Repository permissions: <strong>Contents: Read &amp; Write</strong>
+      </div>
     </div>
+
     <button class="btn-red" id="saveBtn">Save &amp; Continue</button>
     <div class="error-box" id="setupError"></div>
   </div>
@@ -308,7 +408,7 @@ def index():
       <span id="feedUrl"></span>
       <button class="copy-btn" onclick="copyFeed()">Copy</button>
     </div>
-    <p class="hint">File &#x2192; Follow a Show by URL in Apple Podcasts. Works everywhere — no PC needed to listen.</p>
+    <p class="hint">In Apple Podcasts: <strong>File &rarr; Follow a Show by URL</strong>. Works everywhere &mdash; no PC needed to listen.</p>
   </div>
 
   <!-- Download -->
@@ -346,7 +446,7 @@ def index():
       <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
         <path d="M2 7l3.5 3.5L12 3" stroke="#4caf50" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      Live in Apple Podcasts &#x2014; refresh your feed
+      Live in Apple Podcasts &mdash; refresh your feed
     </div>
   </div>
 </div>
@@ -359,12 +459,11 @@ async function init() {
   if (!cfg.configured) {
     $('setupCard').style.display = 'block';
   } else {
-    showMain(cfg.fly_url);
+    showMain(cfg.feed_url);
   }
 }
 
-function showMain(flyUrl) {
-  const feedUrl = flyUrl.replace(/\/$/, '') + '/feed.xml';
+function showMain(feedUrl) {
   $('feedUrl').textContent = feedUrl;
   $('feedCard').style.display = 'block';
   $('downloadCard').style.display = 'block';
@@ -381,17 +480,21 @@ $('saveBtn').addEventListener('click', async () => {
   const err = $('setupError');
   err.style.display = 'none';
   const body = {
+    podcast_name:  $('cfgPodcastName').value.trim(),
+    podcast_desc:  $('cfgPodcastDesc').value.trim(),
     podcast_id:    $('cfgPodcastId').value.trim(),
     ia_access_key: $('cfgIaAccess').value.trim(),
     ia_secret_key: $('cfgIaSecret').value.trim(),
-    fly_url:       $('cfgFlyUrl').value.trim(),
-    fly_token:     $('cfgFlyToken').value.trim(),
+    github_repo:   $('cfgGhRepo').value.trim(),
+    github_token:  $('cfgGhToken').value.trim(),
   };
   const res = await fetch('/api/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const data = await res.json();
   if (!res.ok) { err.textContent = data.error; err.style.display='block'; return; }
   $('setupCard').style.display = 'none';
-  showMain(body.fly_url);
+  const owner = body.github_repo.split('/')[0];
+  const repo  = body.github_repo.split('/')[1];
+  showMain(`https://${owner}.github.io/${repo}/feed.xml`);
 });
 
 $('dlBtn').addEventListener('click', startDl);
@@ -428,6 +531,8 @@ async function poll(jobId) {
         setProgress(j.percent||0, 'Converting to MP3\u2026', '', '');
       } else if (j.phase === 'uploading') {
         setProgress(j.percent||0, 'Uploading to Archive.org\u2026', '', '');
+      } else if (j.phase === 'publishing') {
+        setProgress(j.percent||95, 'Publishing to GitHub\u2026', '', '');
       } else {
         setProgress(0, 'Fetching video info\u2026', '', '');
       }

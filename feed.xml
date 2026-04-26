@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" version="2.0">
+  <channel>
+    <title>My YouTube Podcast</title>
+    <description>Audio downloaded from YouTube.</description>
+    <link>https://adamchocholac.github.io/audio-downloader/feed.xml</link>
+    <language>en</language>
+    <itunes:author>My YouTube Podcast</itunes:author>
+    <itunes:explicit>no</itunes:explicit>
+    <itunes:category text="Technology"/>
+  </channel>
+</rss>

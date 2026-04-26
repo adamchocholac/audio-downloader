@@ -5,7 +5,7 @@ from pathlib import Path
 
 from feedgen.feed import FeedGenerator
 
-_DATA_DIR    = Path(os.environ.get("DATA_DIR", "."))
+_DATA_DIR     = Path(os.environ.get("DATA_DIR", "."))
 EPISODES_FILE = _DATA_DIR / "episodes.json"
 
 
@@ -16,31 +16,21 @@ def load_episodes() -> list[dict]:
     return []
 
 
-def save_episode(episode: dict) -> None:
-    episodes = load_episodes()
-    if not any(e.get("filename") == episode["filename"] for e in episodes):
-        episodes.append(episode)
-        with open(EPISODES_FILE, "w", encoding="utf-8") as f:
-            json.dump(episodes, f, indent=2, ensure_ascii=False)
-
-
-def build_rss(host_url: str) -> bytes:
-    feed_url = f"{host_url}/feed.xml"
-
+def build_rss(feed_url: str, podcast_name: str, podcast_desc: str, episodes: list[dict]) -> bytes:
     fg = FeedGenerator()
     fg.load_extension("podcast")
     fg.id(feed_url)
-    fg.title("My YouTube Podcast")
-    fg.description("Audio downloaded from YouTube.")
-    fg.author({"name": "YouTube Podcast"})
+    fg.title(podcast_name)
+    fg.description(podcast_desc)
+    fg.author({"name": podcast_name})
     fg.link(href=feed_url, rel="self")
     fg.language("en")
-    fg.podcast.itunes_author("YouTube Podcast")
+    fg.podcast.itunes_author(podcast_name)
     fg.podcast.itunes_explicit("no")
     fg.podcast.itunes_category("Technology")
 
-    for ep in reversed(load_episodes()):
-        audio_url = f"{host_url}/audio/{ep['filename']}"
+    for ep in reversed(episodes):
+        audio_url = ep["ia_url"]
         fe = fg.add_entry()
         fe.id(audio_url)
         fe.title(ep["title"])
