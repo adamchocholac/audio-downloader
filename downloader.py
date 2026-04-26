@@ -7,13 +7,23 @@ from typing import Callable
 
 import yt_dlp
 
-DOWNLOADS_DIR = Path("downloads")
+# On Fly.io DATA_DIR=/data; locally it defaults to the project folder.
+_DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+DOWNLOADS_DIR = _DATA_DIR / "downloads"
 
-FFMPEG_BIN_DIR = (
+# ffmpeg: on Fly.io it's installed system-wide (/usr/bin/ffmpeg).
+# Locally on Windows we use the WinGet install path.
+_WINGET_FFMPEG = Path(
     r"C:\Users\uziachocho\AppData\Local\Microsoft\WinGet\Packages"
     r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin"
 )
-FFMPEG_EXE = os.path.join(FFMPEG_BIN_DIR, "ffmpeg.exe")
+if _WINGET_FFMPEG.exists():
+    FFMPEG_BIN_DIR = str(_WINGET_FFMPEG)
+    FFMPEG_EXE    = str(_WINGET_FFMPEG / "ffmpeg.exe")
+else:
+    # Linux / Docker — ffmpeg is on PATH
+    FFMPEG_BIN_DIR = ""
+    FFMPEG_EXE     = "ffmpeg"
 
 
 @dataclass
@@ -51,7 +61,7 @@ def download_audio(
     ydl_opts = {
         "format":          "bestaudio/best",
         "outtmpl":         str(DOWNLOADS_DIR / "%(title)s.%(ext)s"),
-        "ffmpeg_location": FFMPEG_BIN_DIR,
+        **( {"ffmpeg_location": FFMPEG_BIN_DIR} if FFMPEG_BIN_DIR else {} ),
         "progress_hooks":  [_dl_hook],
         "quiet":           True,
         "no_warnings":     True,

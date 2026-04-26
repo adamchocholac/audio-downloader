@@ -1,10 +1,12 @@
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 from feedgen.feed import FeedGenerator
 
-EPISODES_FILE = Path("episodes.json")
+_DATA_DIR    = Path(os.environ.get("DATA_DIR", "."))
+EPISODES_FILE = _DATA_DIR / "episodes.json"
 
 
 def load_episodes() -> list[dict]:
