@@ -29,7 +29,7 @@ import requests as http_requests
 from flask import Flask, jsonify, request, send_from_directory, abort
 
 from downloader import download_audio, DOWNLOADS_DIR
-from uploader import upload_to_archive
+from uploader import upload_to_archive, delete_from_archive
 from feed import build_rss
 
 app  = Flask(__name__)
@@ -77,75 +77,72 @@ def _extract_video_id(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Pages push
+# GitHub helpers
 # ---------------------------------------------------------------------------
 
-def _push_to_github(episode: dict, cfg: dict) -> None:
-    owner, repo = cfg["github_repo"].split("/", 1)
-    token       = cfg["github_token"]
-    headers     = {
+def _gh_headers(token: str) -> dict:
+    return {
         "Authorization":        f"Bearer {token}",
         "Accept":               "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    base_url = f"https://api.github.com/repos/{owner}/{repo}/contents"
 
-    # Load current episodes.json from GitHub
-    episodes:     list[dict] = []
-    episodes_sha: str | None = None
-    r = http_requests.get(f"{base_url}/episodes.json", headers=headers, timeout=15)
+
+def _gh_get_file(base_url: str, path: str, token: str):
+    """Returns (content_list_or_dict, sha) or (None, None) if not found."""
+    r = http_requests.get(f"{base_url}/{path}", headers=_gh_headers(token), timeout=15)
     if r.status_code == 200:
-        data         = r.json()
-        episodes_sha = data["sha"]
-        episodes     = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+        data = r.json()
+        content = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+        return content, data["sha"]
+    return None, None
 
-    # Add episode (deduplicate by filename)
-    if not any(e.get("filename") == episode["filename"] for e in episodes):
-        episodes.append(episode)
 
-    # Generate RSS XML
-    feed_url  = f"{_pages_url(cfg['github_repo'])}/feed.xml"
+def _gh_put_file(base_url: str, path: str, token: str, message: str, content_bytes: bytes, sha: str | None):
+    payload: dict = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode(),
+    }
+    if sha:
+        payload["sha"] = sha
+    http_requests.put(
+        f"{base_url}/{path}",
+        json=payload, headers=_gh_headers(token), timeout=15,
+    ).raise_for_status()
+
+
+def _push_to_github(episodes: list[dict], commit_msg: str, cfg: dict) -> None:
+    owner, repo  = cfg["github_repo"].split("/", 1)
+    token        = cfg["github_token"]
+    base_url     = f"https://api.github.com/repos/{owner}/{repo}/contents"
+    feed_url     = f"{_pages_url(cfg['github_repo'])}/feed.xml"
+
+    # Active episodes only in the RSS feed
+    active = [e for e in episodes if not e.get("deleted")]
     rss_bytes = build_rss(
         feed_url     = feed_url,
         podcast_name = cfg.get("podcast_name") or "My YouTube Podcast",
         podcast_desc = cfg.get("podcast_desc") or "Audio downloaded from YouTube.",
-        episodes     = episodes,
+        episodes     = active,
     )
 
-    # Commit episodes.json
-    episodes_payload: dict = {
-        "message": f"Add episode: {episode['title']}",
-        "content": base64.b64encode(
-            json.dumps(episodes, indent=2, ensure_ascii=False).encode()
-        ).decode(),
-    }
-    if episodes_sha:
-        episodes_payload["sha"] = episodes_sha
-    http_requests.put(
-        f"{base_url}/episodes.json",
-        json=episodes_payload, headers=headers, timeout=15,
-    ).raise_for_status()
+    _, ep_sha   = _gh_get_file(base_url, "episodes.json", token)
+    _, feed_sha = _gh_get_file(base_url, "feed.xml", token)
 
-    # Commit feed.xml
-    feed_sha: str | None = None
-    r = http_requests.get(f"{base_url}/feed.xml", headers=headers, timeout=15)
-    if r.status_code == 200:
-        feed_sha = r.json()["sha"]
+    _gh_put_file(base_url, "episodes.json", token, commit_msg,
+                 json.dumps(episodes, indent=2, ensure_ascii=False).encode(), ep_sha)
+    _gh_put_file(base_url, "feed.xml", token, commit_msg, rss_bytes, feed_sha)
 
-    feed_payload: dict = {
-        "message": f"Update feed: {episode['title']}",
-        "content": base64.b64encode(rss_bytes).decode(),
-    }
-    if feed_sha:
-        feed_payload["sha"] = feed_sha
-    http_requests.put(
-        f"{base_url}/feed.xml",
-        json=feed_payload, headers=headers, timeout=15,
-    ).raise_for_status()
+
+def _load_episodes_from_github(cfg: dict) -> list[dict]:
+    owner, repo = cfg["github_repo"].split("/", 1)
+    base_url    = f"https://api.github.com/repos/{owner}/{repo}/contents"
+    episodes, _ = _gh_get_file(base_url, "episodes.json", cfg["github_token"])
+    return episodes or []
 
 
 # ---------------------------------------------------------------------------
-# Background job
+# Background job — add episode
 # ---------------------------------------------------------------------------
 
 def _run_job(job_id: str, url: str) -> None:
@@ -177,16 +174,22 @@ def _run_job(job_id: str, url: str) -> None:
         # Phase 4: push to GitHub Pages
         progress({"phase": "publishing", "percent": 95})
         episode = {
-            "title":       result.title,
-            "filename":    result.filename,
-            "ia_url":      ia_url,
-            "duration":    result.duration,
-            "uploader":    result.uploader,
-            "thumbnail":   result.thumbnail,
-            "description": result.title,
-            "published":   datetime.now(timezone.utc).isoformat(),
+            "title":         result.title,
+            "filename":      result.filename,
+            "ia_url":        ia_url,
+            "ia_identifier": identifier,
+            "duration":      result.duration,
+            "uploader":      result.uploader,
+            "thumbnail":     result.thumbnail,
+            "description":   result.title,
+            "published":     datetime.now(timezone.utc).isoformat(),
+            "deleted":       False,
         }
-        _push_to_github(episode, cfg)
+
+        episodes = _load_episodes_from_github(cfg)
+        if not any(e.get("filename") == episode["filename"] for e in episodes):
+            episodes.append(episode)
+        _push_to_github(episodes, f"Add episode: {result.title}", cfg)
 
         with jobs_lock:
             jobs[job_id] = {
@@ -230,6 +233,49 @@ def api_config_status():
         "configured": config_ok(),
         "feed_url":   feed_url,
     })
+
+
+@app.get("/api/episodes")
+def api_get_episodes():
+    if not config_ok():
+        return jsonify([])
+    try:
+        episodes = _load_episodes_from_github(load_config())
+        return jsonify(episodes)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.delete("/api/episodes/<path:filename>")
+def api_delete_episode(filename: str):
+    if not config_ok():
+        return jsonify({"error": "Not configured"}), 400
+    cfg = load_config()
+    try:
+        episodes = _load_episodes_from_github(cfg)
+        target = next((e for e in episodes if e.get("filename") == filename), None)
+        if not target:
+            return jsonify({"error": "Episode not found"}), 404
+
+        # Delete from Internet Archive
+        identifier = target.get("ia_identifier", "")
+        if identifier:
+            try:
+                delete_from_archive(
+                    identifier = identifier,
+                    filename   = filename,
+                    access_key = cfg["ia_access_key"],
+                    secret_key = cfg["ia_secret_key"],
+                )
+            except Exception:
+                pass  # IA deletion best-effort; still mark deleted in feed
+
+        # Mark as deleted (keep history)
+        target["deleted"] = True
+        _push_to_github(episodes, f"Delete episode: {target.get('title', filename)}", cfg)
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.post("/api/download")
@@ -337,6 +383,22 @@ def index():
     .ep-meta span{font-size:.78rem;color:#666}
     .badge{display:inline-flex;align-items:center;gap:.4rem;background:#1a3a1a;border:1px solid #2a5a2a;border-radius:8px;color:#4caf50;font-size:.8rem;font-weight:600;padding:.45rem .85rem;margin-top:.25rem}
 
+    /* episode list */
+    #episodesCard{display:none}
+    .ep-list{display:flex;flex-direction:column;gap:.6rem}
+    .ep-item{display:flex;align-items:center;gap:.75rem;background:#111;border:1px solid #2a2a2a;border-radius:10px;padding:.65rem .75rem;transition:opacity .2s}
+    .ep-item.deleted{opacity:.4}
+    .ep-item img{width:44px;height:44px;object-fit:cover;border-radius:6px;background:#1e1e1e;flex-shrink:0}
+    .ep-info{flex:1;min-width:0}
+    .ep-info strong{display:block;font-size:.85rem;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ep-info span{font-size:.72rem;color:#555}
+    .ep-item.deleted .ep-info strong{text-decoration:line-through;color:#666}
+    .del-badge{font-size:.65rem;background:#2a1111;border:1px solid #5c2020;border-radius:5px;color:#884444;padding:.15rem .4rem;flex-shrink:0}
+    .btn-del{background:none;border:1px solid #3a1a1a;border-radius:7px;color:#cc4444;cursor:pointer;font-size:.75rem;padding:.3rem .6rem;white-space:nowrap;transition:background .15s,color .15s}
+    .btn-del:hover:not(:disabled){background:#3a1a1a;color:#ff6666}
+    .btn-del:disabled{opacity:.4;cursor:not-allowed}
+    .ep-list-empty{font-size:.82rem;color:#555;text-align:center;padding:.5rem 0}
+
     /* error */
     .error-box{display:none;margin-top:1rem;background:#2a1111;border:1px solid #5c2020;border-radius:10px;color:#ff7070;font-size:.82rem;padding:.7rem 1rem}
   </style>
@@ -366,7 +428,7 @@ def index():
     <div class="field">
       <label>Podcast ID <small style="text-transform:none;letter-spacing:0;font-weight:400;color:#555">(unique slug)</small></label>
       <input type="text" id="cfgPodcastId" placeholder="my-podcast"/>
-      <div class="hint">Used as the Archive.org item prefix, e.g. <code>my-podcast-abc123</code>. Must be globally unique.</div>
+      <div class="hint">Used as the Archive.org item prefix. Must be globally unique.</div>
     </div>
 
     <div class="section-sep"></div>
@@ -386,14 +448,13 @@ def index():
     <div class="field">
       <label>GitHub Repository</label>
       <input type="text" id="cfgGhRepo" placeholder="username/repo-name"/>
-      <div class="hint">e.g. <code>adamchocholac/audio-downloader</code></div>
     </div>
     <div class="field">
       <label>GitHub Personal Access Token</label>
       <input type="password" id="cfgGhToken" placeholder="github_pat_..."/>
       <div class="hint">
         <a href="https://github.com/settings/tokens?type=beta" target="_blank">github.com/settings/tokens</a>
-        &rarr; Fine-grained token &rarr; Repository permissions: <strong>Contents: Read &amp; Write</strong>
+        &rarr; Fine-grained &rarr; Contents: Read &amp; Write
       </div>
     </div>
 
@@ -408,10 +469,10 @@ def index():
       <span id="feedUrl"></span>
       <button class="copy-btn" onclick="copyFeed()">Copy</button>
     </div>
-    <p class="hint">In Apple Podcasts: <strong>File &rarr; Follow a Show by URL</strong>. Works everywhere &mdash; no PC needed to listen.</p>
+    <p class="hint">In Apple Podcasts: <strong>File &rarr; Follow a Show by URL</strong>.</p>
   </div>
 
-  <!-- Download -->
+  <!-- Add Episode -->
   <div class="card" id="downloadCard" style="display:none">
     <div class="card-title">Add Episode</div>
     <label for="urlInput">YouTube URL</label>
@@ -449,6 +510,17 @@ def index():
       Live in Apple Podcasts &mdash; refresh your feed
     </div>
   </div>
+
+  <!-- Episode List -->
+  <div class="card" id="episodesCard">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Episode History</span>
+      <button class="copy-btn" onclick="loadEpisodes()" id="refreshBtn">Refresh</button>
+    </div>
+    <div class="ep-list" id="epList">
+      <div class="ep-list-empty">Loading&#x2026;</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -467,6 +539,8 @@ function showMain(feedUrl) {
   $('feedUrl').textContent = feedUrl;
   $('feedCard').style.display = 'block';
   $('downloadCard').style.display = 'block';
+  $('episodesCard').style.display = 'block';
+  loadEpisodes();
 }
 
 function copyFeed() {
@@ -492,8 +566,7 @@ $('saveBtn').addEventListener('click', async () => {
   const data = await res.json();
   if (!res.ok) { err.textContent = data.error; err.style.display='block'; return; }
   $('setupCard').style.display = 'none';
-  const owner = body.github_repo.split('/')[0];
-  const repo  = body.github_repo.split('/')[1];
+  const [owner, repo] = body.github_repo.split('/');
   showMain(`https://${owner}.github.io/${repo}/feed.xml`);
 });
 
@@ -522,7 +595,7 @@ async function poll(jobId) {
     try {
       const j = await (await fetch('/api/status/' + jobId)).json();
       if (j.status === 'done') {
-        clearInterval(iv); done(null); showResult(j);
+        clearInterval(iv); done(null); showResult(j); loadEpisodes();
       } else if (j.status === 'error') {
         clearInterval(iv); done('Error: ' + j.error);
       } else if (j.phase === 'downloading') {
@@ -569,6 +642,54 @@ function showResult(j) {
   $('rMeta').textContent = j.uploader + '  \u00b7  ' + m + ':' + s;
   $('resultCard').style.display = 'block';
   $('urlInput').value = '';
+}
+
+async function loadEpisodes() {
+  const list = $('epList');
+  list.innerHTML = '<div class="ep-list-empty">Loading\u2026</div>';
+  try {
+    const episodes = await (await fetch('/api/episodes')).json();
+    if (!Array.isArray(episodes) || episodes.length === 0) {
+      list.innerHTML = '<div class="ep-list-empty">No episodes yet.</div>';
+      return;
+    }
+    // Show newest first
+    list.innerHTML = [...episodes].reverse().map(ep => {
+      const deleted = !!ep.deleted;
+      const m = Math.floor((ep.duration||0)/60), s = String((ep.duration||0)%60).padStart(2,'0');
+      const date = ep.published ? new Date(ep.published).toLocaleDateString() : '';
+      return `
+        <div class="ep-item${deleted?' deleted':''}" id="ep-${encodeURIComponent(ep.filename)}">
+          <img src="${ep.thumbnail||''}" alt="" onerror="this.style.display='none'"/>
+          <div class="ep-info">
+            <strong title="${ep.title.replace(/"/g,'&quot;')}">${ep.title}</strong>
+            <span>${ep.uploader||''} &middot; ${m}:${s.padStart(2,'0')} &middot; ${date}</span>
+          </div>
+          ${deleted
+            ? '<span class="del-badge">Deleted</span>'
+            : `<button class="btn-del" onclick="deleteEpisode('${ep.filename.replace(/'/g,"\\'")}', this)">Delete</button>`
+          }
+        </div>`;
+    }).join('');
+  } catch(e) {
+    list.innerHTML = '<div class="ep-list-empty">Failed to load episodes.</div>';
+  }
+}
+
+async function deleteEpisode(filename, btn) {
+  if (!confirm('Delete this episode? The audio will be removed from Archive.org and the podcast feed.')) return;
+  btn.disabled = true;
+  btn.textContent = 'Deleting\u2026';
+  try {
+    const res = await fetch('/api/episodes/' + encodeURIComponent(filename), {method:'DELETE'});
+    const data = await res.json();
+    if (!res.ok) { alert('Error: ' + data.error); btn.disabled = false; btn.textContent = 'Delete'; return; }
+    loadEpisodes();
+  } catch(e) {
+    alert('Network error: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Delete';
+  }
 }
 
 init();

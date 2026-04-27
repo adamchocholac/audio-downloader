@@ -7,12 +7,9 @@ from typing import Callable
 
 import yt_dlp
 
-# On Fly.io DATA_DIR=/data; locally it defaults to the project folder.
 _DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 DOWNLOADS_DIR = _DATA_DIR / "downloads"
 
-# ffmpeg: on Fly.io it's installed system-wide (/usr/bin/ffmpeg).
-# Locally on Windows we use the WinGet install path.
 _WINGET_FFMPEG = Path(
     r"C:\Users\uziachocho\AppData\Local\Microsoft\WinGet\Packages"
     r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin"
@@ -21,7 +18,6 @@ if _WINGET_FFMPEG.exists():
     FFMPEG_BIN_DIR = str(_WINGET_FFMPEG)
     FFMPEG_EXE    = str(_WINGET_FFMPEG / "ffmpeg.exe")
 else:
-    # Linux / Docker — ffmpeg is on PATH
     FFMPEG_BIN_DIR = ""
     FFMPEG_EXE     = "ffmpeg"
 
@@ -41,7 +37,6 @@ def download_audio(
 ) -> DownloadResult:
     DOWNLOADS_DIR.mkdir(exist_ok=True)
 
-    # ── Step 1: download raw audio only, no postprocessor ────────────────────
     def _dl_hook(d: dict) -> None:
         if on_progress is None:
             return
@@ -71,18 +66,15 @@ def download_audio(
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         dl_info = ydl.extract_info(url, download=True)
 
-    # Metadata from the single download call
     title     = dl_info.get("title", "audio")
     duration  = dl_info.get("duration", 0) or 0
     uploader  = dl_info.get("uploader", "Unknown")
     thumbnail = dl_info.get("thumbnail", "")
 
-    # Actual file path yt-dlp wrote (trust this over anything we compute)
     requested = (dl_info.get("requested_downloads") or [{}])[0]
     raw_path  = Path(requested.get("filepath") or "")
 
     if not raw_path.exists():
-        # Fallback: newest non-mp3 file
         candidates = sorted(
             [f for f in DOWNLOADS_DIR.iterdir() if f.suffix.lower() != ".mp3"],
             key=lambda f: f.stat().st_mtime, reverse=True,
@@ -91,7 +83,6 @@ def download_audio(
             raise FileNotFoundError("Downloaded audio file not found.")
         raw_path = candidates[0]
 
-    # ── Step 2: convert to MP3 with live ffmpeg progress ─────────────────────
     mp3_path = raw_path.with_suffix(".mp3")
     _convert_to_mp3(raw_path, mp3_path, duration, on_progress)
 
