@@ -22,11 +22,12 @@ import re
 import threading
 import uuid
 import os
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests as http_requests
-from flask import Flask, jsonify, request, send_from_directory, abort
+from flask import Flask, jsonify, request, send_from_directory, abort, Response
 
 from downloader import download_audio, DOWNLOADS_DIR
 from uploader import upload_to_archive, delete_from_archive
@@ -36,6 +37,39 @@ app  = Flask(__name__)
 PORT = int(os.environ.get("PORT", 5000))
 
 CONFIG_FILE = Path("config.json")
+
+# ---------------------------------------------------------------------------
+# Basic Auth — set AUTH_USERNAME + AUTH_PASSWORD env vars to enable.
+# If neither is set the app runs without auth (local dev convenience).
+# ---------------------------------------------------------------------------
+
+_AUTH_USER = os.environ.get("AUTH_USERNAME", "").strip()
+_AUTH_PASS = os.environ.get("AUTH_PASSWORD", "").strip()
+_AUTH_ON   = bool(_AUTH_USER and _AUTH_PASS)
+
+
+def _check_auth(username: str, password: str) -> bool:
+    return (
+        secrets.compare_digest(username, _AUTH_USER)
+        and secrets.compare_digest(password, _AUTH_PASS)
+    )
+
+
+def _require_auth() -> Response:
+    return Response(
+        "Authentication required.",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Podcast Downloader"'},
+    )
+
+
+@app.before_request
+def _auth_gate():
+    if not _AUTH_ON:
+        return  # auth disabled locally
+    auth = request.authorization
+    if not auth or not _check_auth(auth.username, auth.password):
+        return _require_auth()
 
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
