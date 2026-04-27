@@ -1,4 +1,4 @@
-name: Build & Push Docker Image
+name: Build, Push & Deploy
 
 on:
   push:
@@ -13,41 +13,75 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  REGION: us-central1
+  SERVICE: podcast-downloader
+  IMAGE: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/podcast/downloader
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: write       # for ghcr.io
+      id-token: write       # for GCP auth
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
+      # ── Also push to GitHub Container Registry (optional mirror) ──────────
+      - name: Log in to ghcr.io
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      # ── Authenticate with Google Cloud ────────────────────────────────────
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Build and push
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      # ── Build & push to both registries ───────────────────────────────────
+      - name: Build and push image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+
+      # ── Deploy to Cloud Run ───────────────────────────────────────────────
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE }}
+          region:  ${{ env.REGION }}
+          image:   ${{ env.IMAGE }}:latest
+          flags:   >-
+            --allow-unauthenticated
+            --memory=512Mi
+            --cpu=1
+            --max-instances=1
+            --timeout=3600
+          env_vars: |
+            IA_ACCESS_KEY=${{ secrets.IA_ACCESS_KEY }}
+            IA_SECRET_KEY=${{ secrets.IA_SECRET_KEY }}
+            GITHUB_TOKEN_APP=${{ secrets.GH_TOKEN_APP }}
+            GITHUB_REPO=${{ secrets.GITHUB_REPO }}
+            PODCAST_ID=${{ secrets.PODCAST_ID }}
+            PODCAST_NAME=${{ secrets.PODCAST_NAME }}
+            PODCAST_DESC=${{ secrets.PODCAST_DESC }}
+
+      - name: Print service URL
+        run: echo "App is live at ${{ steps.deploy.outputs.url }}"

@@ -52,13 +52,14 @@ def load_config() -> dict:
             cfg = json.load(f)
     # Environment variables override / supplement config.json (used in Docker/K8s)
     env_map = {
-        "IA_ACCESS_KEY":  "ia_access_key",
-        "IA_SECRET_KEY":  "ia_secret_key",
-        "GITHUB_TOKEN":   "github_token",
-        "GITHUB_REPO":    "github_repo",
-        "PODCAST_ID":     "podcast_id",
-        "PODCAST_NAME":   "podcast_name",
-        "PODCAST_DESC":   "podcast_desc",
+        "IA_ACCESS_KEY":   "ia_access_key",
+        "IA_SECRET_KEY":   "ia_secret_key",
+        "GH_TOKEN_APP":    "github_token",   # GH_TOKEN_APP avoids conflict with GitHub Actions' GITHUB_TOKEN
+        "GITHUB_TOKEN":    "github_token",   # also accept plain GITHUB_TOKEN for local/docker-compose use
+        "GITHUB_REPO":     "github_repo",
+        "PODCAST_ID":      "podcast_id",
+        "PODCAST_NAME":    "podcast_name",
+        "PODCAST_DESC":    "podcast_desc",
     }
     for env_key, cfg_key in env_map.items():
         val = os.environ.get(env_key, "").strip()
