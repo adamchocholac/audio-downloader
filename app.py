@@ -46,10 +46,25 @@ jobs_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
+    cfg: dict = {}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            cfg = json.load(f)
+    # Environment variables override / supplement config.json (used in Docker/K8s)
+    env_map = {
+        "IA_ACCESS_KEY":  "ia_access_key",
+        "IA_SECRET_KEY":  "ia_secret_key",
+        "GITHUB_TOKEN":   "github_token",
+        "GITHUB_REPO":    "github_repo",
+        "PODCAST_ID":     "podcast_id",
+        "PODCAST_NAME":   "podcast_name",
+        "PODCAST_DESC":   "podcast_desc",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            cfg[cfg_key] = val
+    return cfg
 
 
 def save_config(cfg: dict) -> None:
@@ -89,13 +104,21 @@ def _gh_headers(token: str) -> dict:
 
 
 def _gh_get_file(base_url: str, path: str, token: str):
-    """Returns (content_list_or_dict, sha) or (None, None) if not found."""
+    """Returns (parsed_json_content, sha) or (None, None) if not found."""
     r = http_requests.get(f"{base_url}/{path}", headers=_gh_headers(token), timeout=15)
     if r.status_code == 200:
         data = r.json()
         content = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
         return content, data["sha"]
     return None, None
+
+
+def _gh_get_sha(base_url: str, path: str, token: str) -> str | None:
+    """Returns just the SHA of a file (works for any file type, not just JSON)."""
+    r = http_requests.get(f"{base_url}/{path}", headers=_gh_headers(token), timeout=15)
+    if r.status_code == 200:
+        return r.json()["sha"]
+    return None
 
 
 def _gh_put_file(base_url: str, path: str, token: str, message: str, content_bytes: bytes, sha: str | None):
@@ -126,8 +149,8 @@ def _push_to_github(episodes: list[dict], commit_msg: str, cfg: dict) -> None:
         episodes     = active,
     )
 
-    _, ep_sha   = _gh_get_file(base_url, "episodes.json", token)
-    _, feed_sha = _gh_get_file(base_url, "feed.xml", token)
+    _, ep_sha = _gh_get_file(base_url, "episodes.json", token)
+    feed_sha  = _gh_get_sha(base_url, "feed.xml", token)
 
     _gh_put_file(base_url, "episodes.json", token, commit_msg,
                  json.dumps(episodes, indent=2, ensure_ascii=False).encode(), ep_sha)

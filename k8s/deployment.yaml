@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podcast-downloader
+  namespace: default
+  labels:
+    app: podcast-downloader
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: podcast-downloader
+  template:
+    metadata:
+      labels:
+        app: podcast-downloader
+    spec:
+      containers:
+        - name: app
+          image: YOUR_REGISTRY/podcast-downloader:latest   # e.g. docker.io/yourname/podcast-downloader:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5000
+          env:
+            - name: PORT
+              value: "5000"
+            - name: IA_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: podcast-secrets
+                  key: IA_ACCESS_KEY
+            - name: IA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: podcast-secrets
+                  key: IA_SECRET_KEY
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: podcast-secrets
+                  key: GITHUB_TOKEN
+            - name: GITHUB_REPO
+              valueFrom:
+                secretKeyRef:
+                  name: podcast-secrets
+                  key: GITHUB_REPO
+            - name: PODCAST_ID
+              valueFrom:
+                secretKeyRef:
+                  name: podcast-secrets
+                  key: PODCAST_ID
+            - name: PODCAST_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: podcast-secrets
+                  key: PODCAST_NAME
+            - name: PODCAST_DESC
+              valueFrom:
+                secretKeyRef:
+                  name: podcast-secrets
+                  key: PODCAST_DESC
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /api/config-status
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 30

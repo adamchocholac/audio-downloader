@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: podcast-downloader
+  namespace: default
+spec:
+  selector:
+    app: podcast-downloader
+  type: LoadBalancer      # Use NodePort if your cluster doesn't support LoadBalancer
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 5000

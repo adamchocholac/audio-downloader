@@ -13,6 +13,9 @@ downloads/
 # User config (contains credentials)
 config.json
 
+# Kubernetes secret (fill k8s/secret.yaml locally, never commit with real values)
+k8s/secret.yaml
+
 # macOS
 .DS_Store
 

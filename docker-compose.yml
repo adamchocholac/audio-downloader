@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - IA_ACCESS_KEY=${IA_ACCESS_KEY}
+      - IA_SECRET_KEY=${IA_SECRET_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - PODCAST_ID=${PODCAST_ID}
+      - PODCAST_NAME=${PODCAST_NAME:-My YouTube Podcast}
+      - PODCAST_DESC=${PODCAST_DESC:-Audio downloaded from YouTube.}
+    volumes:
+      # Persist config.json across restarts (optional — not needed if using env vars)
+      - app_data:/app
+      # Mount local downloads folder so you can inspect files during dev
+      # - ./downloads:/app/downloads
+
+volumes:
+  app_data:

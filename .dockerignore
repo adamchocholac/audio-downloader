@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+downloads/
+config.json
+debug-*.log
+.git/
+.github/
+k8s/
+*.md
+.gitignore
+docker-compose.yml
+feed.xml
+episodes.json
