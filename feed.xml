@@ -8,9 +8,19 @@
     <docs>http://www.rssboard.org/rss-specification</docs>
     <generator>python-feedgen</generator>
     <language>en</language>
-    <lastBuildDate>Mon, 27 Apr 2026 07:50:28 +0000</lastBuildDate>
+    <lastBuildDate>Tue, 28 Apr 2026 09:56:13 +0000</lastBuildDate>
     <itunes:author>My YouTube Podcast</itunes:author>
     <itunes:category text="Technology"/>
     <itunes:explicit>no</itunes:explicit>
+    <item>
+      <title>Jakub Enžl II. - LÍZÁNÍ ŽAB V DŽUNGLI, GUILTY PLEASURES, ZÁPASENÍ, BIZÁRNÍ OBSAH, JAK UDĚLAT VIRÁL</title>
+      <description>Jakub Enžl II. - LÍZÁNÍ ŽAB V DŽUNGLI, GUILTY PLEASURES, ZÁPASENÍ, BIZÁRNÍ OBSAH, JAK UDĚLAT VIRÁL</description>
+      <guid isPermaLink="false">https://archive.org/download/my-podcast-7u4_Ay8LaBw/7u4_Ay8LaBw.mp3</guid>
+      <enclosure url="https://archive.org/download/my-podcast-7u4_Ay8LaBw/7u4_Ay8LaBw.mp3" length="0" type="audio/mpeg"/>
+      <pubDate>Tue, 28 Apr 2026 09:56:13 +0000</pubDate>
+      <itunes:author>Vláďa Kadlec - EXPERIENCE</itunes:author>
+      <itunes:image href="https://i.ytimg.com/vi/7u4_Ay8LaBw/maxresdefault.jpg"/>
+      <itunes:duration>4884</itunes:duration>
+    </item>
   </channel>
 </rss>
